@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { proxyArgs, usableProxy, headerArgs } from './args.js';
 
 const HOST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HOST_DIR, '..', '..');
@@ -31,12 +32,6 @@ function jsRuntimeArgs() {
   return DENO ? ['--js-runtimes', `deno:${DENO}`] : [];
 }
 
-// Optional proxy (the extension's VPN runs inside Chrome only; the host is a
-// separate OS process, so it routes traffic itself. A proxy lets it match).
-function proxyArgs(proxy) {
-  const p = String(proxy || '').trim();
-  return /^[a-z0-9.+-]+:\/\//i.test(p) ? ['--proxy', p] : [];
-}
 
 // Turn a user-supplied name into a safe yt-dlp output base (no path traversal,
 // no '%' template injection, no trailing dot). Returns '' if nothing usable.
@@ -116,7 +111,7 @@ let cancelRequested = false;
 // yt-dlp spawns ffmpeg as a child; proc.kill() leaves it orphaned on Windows.
 // Kill the whole tree so nothing keeps holding the output file.
 function killTree(proc) {
-  if (!proc) return;
+  if (!proc?.pid) return;
   if (process.platform === 'win32') {
     try {
       execFileSync('taskkill', ['/PID', String(proc.pid), '/T', '/F']);
@@ -235,9 +230,10 @@ async function ping() {
 }
 
 // Fetch metadata only (no download) so the UI can show a preview first.
-function preview(msg) {
+async function preview(msg) {
   const url = String(msg.url || '');
   if (!/^https?:\/\//i.test(url)) return send({ type: 'previewError', message: 'Invalid URL.' });
+  const proxy = (await usableProxy(msg.proxy)) || '';
 
   let out = '';
   let err = '';
@@ -245,7 +241,7 @@ function preview(msg) {
   try {
     proc = spawn(
       YTDLP,
-      ['-J', '--no-playlist', '--no-warnings', ...proxyArgs(msg.proxy), ...jsRuntimeArgs(), '--', url],
+      ['-J', '--no-playlist', '--no-warnings', ...proxyArgs(proxy), ...headerArgs(msg.headers), ...jsRuntimeArgs(), '--', url],
       { windowsHide: true },
     );
   } catch (e) {
@@ -311,12 +307,17 @@ function qualityArgs(q) {
   return QUALITY.best;
 }
 
-function download(msg) {
+async function download(msg) {
   if (current) return send({ type: 'error', message: 'A download is already running.' });
   cancelRequested = false;
 
   const url = String(msg.url || '');
   if (!/^https?:\/\//i.test(url)) return send({ type: 'error', message: 'Invalid or missing URL.' });
+  current = true; // busy during probe
+  const proxy = await usableProxy(msg.proxy);
+  current = null;
+  if (cancelRequested) return send({ type: 'cancelled' });
+  if (proxy === null) send({ type: 'log', line: '[videograbitel] proxy is offline, downloading directly' });
 
   const outDir = downloadsDir();
   // A user-renamed download uses that name as the output base; otherwise fall back
@@ -343,7 +344,8 @@ function download(msg) {
     args.push('--embed-subs', '--write-auto-subs', '--sub-langs', 'en.*,en');
   }
   if (FFMPEG_DIR) args.push('--ffmpeg-location', FFMPEG_DIR);
-  args.push(...proxyArgs(msg.proxy));
+  args.push(...proxyArgs(proxy));
+  args.push(...headerArgs(msg.headers));
   args.push(...jsRuntimeArgs());
   args.push('--', url); // end-of-options: never treat the URL as a flag
 

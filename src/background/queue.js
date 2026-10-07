@@ -54,6 +54,7 @@ function addJob(spec = {}) {
     title: spec.title || '',
     filename: spec.filename || '',
     proxy: spec.proxy || '',
+    headers: spec.headers && typeof spec.headers === 'object' ? spec.headers : null,
     host: spec.host || '',
     status: 'queued',
     percent: 0,
@@ -166,6 +167,7 @@ function startJob(job) {
       subs: job.subs,
       filename: job.filename,
       proxy: job.proxy,
+      headers: job.headers,
     });
   } catch (e) {
     finishJob(job, { status: 'error', error: e.message });
@@ -202,7 +204,7 @@ function onHostMessage(id, msg) {
       finishJob(job, { status: 'cancelled' });
       break;
     case 'error':
-      finishJob(job, { status: 'error', error: friendlyError(msg.detail || msg.message) || msg.message || 'Download failed.' });
+      finishJob(job, { status: 'error', error: friendlyError(msg.detail || msg.message, job) || msg.message || 'Download failed.' });
       break;
   }
 }
@@ -335,13 +337,17 @@ function engineCheck(sendResponse) {
 }
 
 // Turn common yt-dlp stderr into a plain-language, actionable message.
-function friendlyError(text) {
+function friendlyError(text, job) {
   const d = (text || '').toLowerCase();
+  const noProxy = !job?.proxy;
   if (/sign in to confirm|not a bot|confirm you.?re not a bot/.test(d))
     return 'YouTube wants a sign-in / bot check for this video. Try again shortly.';
   if (/requested format is not available/.test(d)) return 'That quality isn’t available — try “Best”.';
   if (/http error 429|too many requests/.test(d)) return 'Rate-limited by the server — wait a moment and retry.';
-  if (/http error 403|forbidden/.test(d)) return 'The server blocked the request (403). Try again in a moment.';
+  if (/http error 403|forbidden/.test(d))
+    return noProxy
+      ? 'The server blocked the request (403). Chrome uses your VPN but downloads don’t: set the proxy in ⚙ settings.'
+      : 'The server blocked the request (403). Try again in a moment.';
   if (/private video|video unavailable|video is unavailable|members-only/.test(d))
     return 'This video is private, members-only, or unavailable.';
   if (/not available in your country|geo|in your location/.test(d))
@@ -352,7 +358,7 @@ function friendlyError(text) {
   if (/unsupported url|unable to extract|no video formats|nothing to download/.test(d))
     return 'No downloadable video found here.';
   if (/ffmpeg|postprocess/.test(d)) return 'Conversion failed — is ffmpeg installed? Run “npm run fetch-tools”.';
-  if (/timed out|timeout|connection|network is unreachable|getaddrinfo|resolve/.test(d))
+  if (/timed out|timeout|connection|network is unreachable|getaddrinfo|resolve|eof occurred|ssl/.test(d))
     return 'Network error reaching the site — if it needs a VPN, enable a proxy in settings.';
   return null;
 }

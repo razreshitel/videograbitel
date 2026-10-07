@@ -72,6 +72,7 @@ function streamCandidate(it) {
     host: it.host || safeHost(it.url),
     name: it.name || it.host || it.url,
     size: it.size || 0,
+    headers: it.headers || null,
   });
 }
 function mkCandidate(base) {
@@ -231,10 +232,28 @@ function phaseLabel(name) {
 }
 
 // --- actions ----------------------------------------------------------------
+// Browser headers, page fallback
+function streamHeaders(c) {
+  return {
+    referer: tab?.url || '',
+    userAgent: navigator.userAgent,
+    ...(c.headers || {}),
+  };
+}
+
 async function startDownload(c) {
   const quality = qualityEl.value || 'best';
   const res = await send('queue:add', {
-    job: { kind: c.kind, url: c.url, quality, title: c.name, filename: c.name, host: c.host, proxy: proxyArg() },
+    job: {
+      kind: c.kind,
+      url: c.url,
+      quality,
+      title: c.name,
+      filename: c.name,
+      host: c.host,
+      proxy: proxyArg(),
+      headers: c.kind === 'page' ? null : streamHeaders(c),
+    },
   });
   if (res?.id) {
     c.jobId = res.id;

@@ -99,7 +99,28 @@ function clearTab(tabId) {
 }
 
 // --- detection --------------------------------------------------------------
+// requestId -> browser headers
+const reqHeaders = new Map();
+const KEEP_HEADERS = { referer: 'referer', origin: 'origin', 'user-agent': 'userAgent', cookie: 'cookie' };
+
+chrome.webRequest.onSendHeaders.addListener(
+  (d) => {
+    if (d.tabId < 0) return;
+    const h = {};
+    for (const { name, value } of d.requestHeaders || []) {
+      const k = KEEP_HEADERS[name.toLowerCase()];
+      if (k && value) h[k] = value;
+    }
+    reqHeaders.set(d.requestId, h);
+    if (reqHeaders.size > 500) reqHeaders.delete(reqHeaders.keys().next().value);
+  },
+  { urls: ['<all_urls>'], types: ['media', 'xmlhttprequest', 'other', 'object'] },
+  ['requestHeaders', 'extraHeaders'],
+);
+
 async function onResponse(details) {
+  const headers = reqHeaders.get(details.requestId);
+  reqHeaders.delete(details.requestId);
   if (details.tabId < 0) return; // not attached to a tab (e.g. SW fetch)
   const hit = classify(details);
   if (!hit) return;
@@ -111,6 +132,7 @@ async function onResponse(details) {
   const existing = m.get(key);
   if (existing) {
     if (hit.size && !existing.size) existing.size = hit.size;
+    if (headers) existing.headers = headers;
     return;
   }
   if (m.size >= MAX_PER_TAB) return;
@@ -125,6 +147,7 @@ async function onResponse(details) {
     size: hit.size,
     name: basename(details.url) || hostOf(details.url),
     host: hostOf(details.url),
+    headers: headers || null,
     ts: Date.now(),
   });
 
