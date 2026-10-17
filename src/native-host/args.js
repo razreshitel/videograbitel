@@ -42,6 +42,19 @@ export async function usableProxy(proxy) {
   return p;
 }
 
+// Turn a user-supplied name into a safe yt-dlp output base (no path traversal,
+// no '%' template injection, no trailing dot). Returns '' if nothing usable.
+export function safeName(name) {
+  let s = String(name || '').trim();
+  s = s.replace(/https?:\/\/[^\s«»"“”<>]+/gi, ' '); // links are noise in a file name
+  s = s.replace(/\s*[:|]\s+|\s+\/\s+/g, ' - ');
+  s = s.replace(/[\\/:*?"<>|%\0-\x1f]/g, '_'); // strip unsafe chars (keep spaces & hyphens)
+  s = s.replace(/\s+/g, ' ').replace(/\s+([»”)\]])/g, '$1').replace(/([«“(\[])\s+/g, '$1');
+  s = s.replace(/\.(mp4|mkv|webm|mov|m4v|mp3|m4a|aac|opus|ogg|wav|flac|gif)$/i, ''); // avoid double ext
+  s = s.replace(/^[\s.-]+|[\s.-]+$/g, '');
+  return s.slice(0, 180).trim();
+}
+
 const clean = (v, max) => String(v || '').replace(/[\r\n\0]/g, '').trim().slice(0, max);
 
 // Browser request headers.

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VideoGrabitel",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Open-source video/audio downloader. Detects media on any site and downloads via a local yt-dlp + ffmpeg helper — handles YouTube, HLS, DASH and direct files.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApK3lVn7ql33zOJOyLU/kGwhnAQeMZzgWON4+dpZBBAPVb/D6OsvER2V8fpnYeDRJu3M2gviaAStgE9g95iqvA8pIbqDIAtPNoYI+fs/Np4U53wzNaDf1dm7s/17a/HTe1xDmqdjJtVKVA64e/l8Yxk3JS5qG+BCT9Oaf9vWZmKQi4cGzo/RH4EsfJFOZT2SfuXbEqF+voPYba7mzO4Di4Cu85t5SzZdGN+rWY2NSS4qAl7ZotiLt1ZiNoLYIawe+9QYrCMBDVGMeZnNvQEcKmRdUOGf0nocoyjWPBzndJA+jjzZX5FfjI+Dwf+nfhpA8yC5lz6kFh/QMe//xlj0NLwIDAQAB",
   "permissions": ["webRequest", "storage", "tabs", "nativeMessaging"],
@@ -10,6 +10,20 @@
     "service_worker": "src/background/service-worker.js",
     "type": "module"
   },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["src/content/scanner.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/content/scan-main.js", "src/lib/scan-core.js", "src/lib/util.js"],
+      "matches": ["http://*/*", "https://*/*"]
+    }
+  ],
   "action": {
     "default_popup": "src/popup/popup.html",
     "default_title": "VideoGrabitel",

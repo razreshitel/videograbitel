@@ -14,11 +14,19 @@ media, browsing data, or downloaded files to a separate service.
 
 - Supports websites handled by yt-dlp, including YouTube.
 - Detects HLS, DASH, and direct media files.
+- Scans page markup and embedded JSON for media the page has not requested yet,
+  for example a video on a later slide of a cover carousel, and verifies each
+  link with a HEAD request before listing it.
+- Saves Pixiv animations (ugoira) as GIFs with the original frame timing. The
+  frame ZIP is fetched by the helper (HTTP proxies only) and assembled by ffmpeg.
+- Plays a detected file in a new browser tab on double-click of its preview.
 - Displays titles, thumbnails, durations, available resolutions, and download
   progress in the extension popup.
 - Supports video downloads up to 1080p by default and audio extraction to MP3.
 - Allows the output filename to be edited before a download begins.
 - Continues active downloads after the popup is closed.
+- Shows downloads from other tabs: running ones at the top of the list, finished
+  ones at the bottom until dismissed with x.
 - Opens completed files or displays them in the system file manager.
 - Supports an optional HTTP or SOCKS proxy for the local download process.
 - Filters stream segments, small media responses, script endpoints, and opaque
@@ -88,6 +96,10 @@ host manifest to authorize the extension consistently.
 6. Select Download.
 7. After completion, select Open or Show in folder.
 
+Double-click the preview box of a detected file to play it in a new tab using
+the browser's own player. HLS and DASH manifests cannot play natively, so use
+Download for those.
+
 Downloaded files are written to the current user's Downloads directory.
 
 ## Proxy configuration
@@ -138,6 +150,8 @@ npm run uninstall-host
 | `manifest.json` | Defines the Manifest V3 extension, permissions, and fixed extension key |
 | `src/background/service-worker.js` | Records detected media by browser tab and manages the toolbar badge |
 | `src/background/detector.js` | Classifies media responses and rejects known noise |
+| `src/content/scanner.js`, `src/content/scan-main.js` | Content script that reports media URLs found in the DOM and page text |
+| `src/lib/scan-core.js` | Pure text and JSON scanner used by the content script and tests |
 | `src/background/queue.js` | Manages download jobs and native host connections |
 | `src/background/queue-core.js` | Provides testable queue selection helpers |
 | `src/popup/` | Implements the popup interface, settings, progress, and engine status |

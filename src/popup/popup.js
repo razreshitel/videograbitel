@@ -40,6 +40,10 @@ const safeHost = (u) => {
   }
 };
 const fileBase = (p) => String(p || '').split(/[\\/]/).pop() || String(p || '');
+const isActiveJob = (j) => j?.status === 'queued' || j?.status === 'running' || j?.status === 'postprocess';
+// Drop " / X", " - YouTube" style suffixes.
+const cleanTitle = (t) =>
+  String(t || '').replace(/\s+[/|\-–]\s+(X|Twitter|YouTube|Twitch|VK Видео|VK|Vimeo|Reddit)$/i, '').trim();
 
 // --- settings ---------------------------------------------------------------
 async function loadSettings() {
@@ -62,7 +66,22 @@ proxyUrl.addEventListener('blur', saveSettings);
 
 // --- candidates -------------------------------------------------------------
 function pageCandidate(t) {
-  return mkCandidate({ key: 'page:' + t.url, kind: 'page', url: t.url, host: safeHost(t.url), name: t.title || t.url, main: true });
+  return mkCandidate({ key: 'page:' + t.url, kind: 'page', url: t.url, host: safeHost(t.url), name: cleanTitle(t.title) || t.url, main: true });
+}
+// A download started from another page.
+function jobCandidate(j) {
+  return mkCandidate({
+    key: 'job:' + j.id,
+    kind: j.kind,
+    url: j.url,
+    host: j.host || safeHost(j.url),
+    name: j.filename || j.title || j.host || j.url,
+    thumbnail: j.thumbnail || '',
+    duration: j.duration || 0,
+    uploader: j.uploader || '',
+    jobId: j.id,
+    foreign: true,
+  });
 }
 function streamCandidate(it) {
   return mkCandidate({
@@ -73,10 +92,15 @@ function streamCandidate(it) {
     name: it.name || it.host || it.url,
     size: it.size || 0,
     headers: it.headers || null,
+    ugoira: it.ugoira || null,
+    uploader: it.uploader || '',
+    duration: it.duration || 0,
+    frames: it.frames || 0,
+    main: it.kind === 'ugoira',
   });
 }
 function mkCandidate(base) {
-  return { thumbnail: '', duration: 0, heights: [], uploader: '', size: 0, jobId: null, renamed: false, main: false, ...base };
+  return { thumbnail: '', duration: 0, heights: [], uploader: '', size: 0, jobId: null, renamed: false, main: false, foreign: false, ...base };
 }
 
 async function init() {
@@ -84,9 +108,12 @@ async function init() {
   [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
   candidates = [];
-  if (tab?.url && /^https?:/i.test(tab.url)) candidates.push(pageCandidate(tab));
   const media = await send('GET_MEDIA', { tabId: tab?.id });
-  for (const it of media?.items || []) {
+  const items = media?.items || [];
+  // Ugoira replaces page card.
+  const ugoira = items.filter((it) => it.kind === 'ugoira');
+  if (tab?.url && /^https?:/i.test(tab.url) && !ugoira.length) candidates.push(pageCandidate(tab));
+  for (const it of [...ugoira, ...items.filter((it) => it.kind !== 'ugoira')]) {
     if (!candidates.some((c) => c.url === it.url)) candidates.push(streamCandidate(it));
   }
 
@@ -96,18 +123,51 @@ async function init() {
   previewMain();
 }
 
-// Reflect any downloads already running/finished for these URLs (popup reopened).
+// Reflect downloads already running/finished (popup reopened). Jobs from other
+// pages get their own cards: active ones on top, finished ones at the bottom.
 async function syncJobs() {
   const res = await send('queue:list');
+  const all = res?.jobs || [];
   const byUrl = new Map();
-  for (const j of res?.jobs || []) {
+  for (const j of all) {
     jobsById.set(j.id, j);
     const prev = byUrl.get(j.url);
     if (!prev || (j.createdAt || 0) > (prev.createdAt || 0)) byUrl.set(j.url, j);
   }
+  const mine = new Set();
   for (const c of candidates) {
     const j = byUrl.get(c.url);
-    if (j) c.jobId = j.id;
+    if (j) {
+      c.jobId = j.id;
+      mine.add(j.id);
+    }
+  }
+  const other = all.filter((j) => !mine.has(j.id) && j.status !== 'cancelled');
+  const active = other.filter(isActiveJob).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  const finished = other.filter((j) => !isActiveJob(j)).sort((a, b) => (a.endedAt || 0) - (b.endedAt || 0));
+  candidates = [...active.map(jobCandidate), ...candidates, ...finished.map(jobCandidate)];
+}
+
+// Live job from another page: add or move its card.
+function placeForeign(job) {
+  let c = candidates.find((x) => x.jobId === job.id);
+  if (!c) {
+    // own card (queue:add reply may lag)
+    if (!isActiveJob(job) || candidates.some((x) => !x.foreign && x.url === job.url)) return;
+    c = jobCandidate(job);
+    candidates.unshift(c);
+    document.body.classList.remove('is-empty');
+    renderCard(c, true);
+    return;
+  }
+  if (!c.foreign) return;
+  const card = cards.get(c.key);
+  if (job.status === 'cancelled') {
+    send('queue:dismiss', { id: job.id });
+    dropCard(c);
+  } else if (!isActiveJob(job) && card && card !== listEl.lastElementChild) {
+    listEl.appendChild(card);
+    candidates = [...candidates.filter((x) => x !== c), c];
   }
 }
 
@@ -121,7 +181,7 @@ function render() {
 }
 
 // --- a card -----------------------------------------------------------------
-function renderCard(c) {
+function renderCard(c, onTop = false) {
   const card = tpl.content.firstElementChild.cloneNode(true);
   cards.set(c.key, card);
 
@@ -132,9 +192,41 @@ function renderCard(c) {
   card.querySelector('.folder').addEventListener('click', () => c.jobId && send('host:reveal', { id: c.jobId }));
   card.querySelector('.rename').addEventListener('click', () => startRename(c, card));
   card.querySelector('.remove').addEventListener('click', () => removeCard(c));
+  const thumbWrap = card.querySelector('.thumbWrap');
+  if (c.kind !== 'page') {
+    thumbWrap.classList.add('playable');
+    thumbWrap.title = 'Double-click: play in a new tab';
+    thumbWrap.addEventListener('dblclick', () => openStream(c));
+  }
 
-  listEl.appendChild(card);
+  if (c.foreign) card.querySelector('.rename').hidden = true;
+  if (onTop) listEl.prepend(card);
+  else listEl.appendChild(card);
   refreshCard(c);
+}
+
+// Direct files play in Chrome's own player; manifests need a download.
+function openStream(c) {
+  if (c.kind === 'ugoira') {
+    flashStatus('Pixiv animation: Download saves it as a GIF.');
+    return;
+  }
+  if (c.kind === 'hls' || c.kind === 'dash') {
+    flashStatus(`${c.kind.toUpperCase()} streams can't play natively in the browser. Use Download.`);
+    return;
+  }
+  chrome.tabs.create({ url: c.url });
+}
+
+let statusRestore = null;
+function flashStatus(text) {
+  if (statusRestore) clearTimeout(statusRestore);
+  else statusEl.dataset.prev = statusEl.textContent;
+  statusEl.textContent = text;
+  statusRestore = setTimeout(() => {
+    statusEl.textContent = statusEl.dataset.prev || '';
+    statusRestore = null;
+  }, 3000);
 }
 
 function refreshCard(c) {
@@ -160,6 +252,8 @@ function refreshCard(c) {
   }
 
   card.querySelector('.star').hidden = !c.main;
+  const job = c.jobId ? jobsById.get(c.jobId) : null;
+  card.querySelector('.remove').hidden = c.foreign && isActiveJob(job);
 
   const titleEl = card.querySelector('.title');
   if (!titleEl.querySelector('input')) {
@@ -168,7 +262,7 @@ function refreshCard(c) {
   }
   card.querySelector('.sub').textContent = subLine(c);
 
-  setState(card, c.jobId ? jobsById.get(c.jobId) : null);
+  setState(card, job);
 }
 
 function subLine(c) {
@@ -178,6 +272,7 @@ function subLine(c) {
   if (c.heights?.length) bits.push(`up to ${c.heights[0]}p`);
   if (c.size) bits.push(formatBytes(c.size));
   if (c.kind === 'hls' || c.kind === 'dash') bits.push(c.kind.toUpperCase());
+  if (c.kind === 'ugoira') bits.push(`GIF, ${c.frames} frames`);
   return bits.join(' | ');
 }
 
@@ -253,6 +348,10 @@ async function startDownload(c) {
       host: c.host,
       proxy: proxyArg(),
       headers: c.kind === 'page' ? null : streamHeaders(c),
+      ugoira: c.ugoira,
+      thumbnail: c.thumbnail,
+      duration: c.duration,
+      uploader: c.uploader,
     },
   });
   if (res?.id) {
@@ -296,7 +395,14 @@ function startRename(c, card) {
   input.addEventListener('blur', () => commit(true));
 }
 
+// Finished downloads are forgotten in every tab.
 function removeCard(c) {
+  const job = c.jobId ? jobsById.get(c.jobId) : null;
+  if (job && !isActiveJob(job)) send('queue:dismiss', { id: job.id });
+  dropCard(c);
+}
+
+function dropCard(c) {
   cards.get(c.key)?.remove();
   cards.delete(c.key);
   candidates = candidates.filter((x) => x !== c);
@@ -308,7 +414,7 @@ function removeCard(c) {
 
 // --- preview + live updates -------------------------------------------------
 async function previewMain() {
-  const c = candidates.find((x) => x.main);
+  const c = candidates.find((x) => x.main && x.kind === 'page');
   if (!c) return;
   const r = await send('media:preview', { url: c.url, proxy: proxyArg() });
   if (!r?.ok) return;
@@ -323,8 +429,13 @@ async function previewMain() {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'job:update') {
     jobsById.set(msg.job.id, msg.job);
+    placeForeign(msg.job);
     const c = candidates.find((x) => x.jobId === msg.job.id);
     if (c) refreshCard(c);
+  } else if (msg.type === 'job:removed') {
+    jobsById.delete(msg.id);
+    const c = candidates.find((x) => x.jobId === msg.id && x.foreign);
+    if (c) dropCard(c);
   }
 });
 

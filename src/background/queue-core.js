@@ -27,3 +27,13 @@ export function pickQueued(jobs, max) {
     .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
     .slice(0, slots);
 }
+
+// Jobs saved before a worker restart: running ones lost their host process.
+export function restoreJobs(list) {
+  const out = [];
+  for (const j of Array.isArray(list) ? list : []) {
+    if (!j?.id || !j.url) continue;
+    out.push(isActive(j) ? { ...j, status: 'error', error: 'Interrupted. Press Retry.', endedAt: Date.now() } : j);
+  }
+  return out;
+}

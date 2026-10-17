@@ -3,13 +3,13 @@
 // The SW (not the popup) owns the native connections so a download survives the
 // popup closing: each running job has its own connectNative Port (= one host
 // process running one yt-dlp), and the steady progress stream keeps the MV3
-// worker alive for the duration. State is in-memory only — there is no history to
-// persist; when the popup reopens it re-syncs via queue:list and matches jobs to
-// the page's candidates by URL. Preview (metadata for a candidate) is a simple
+// worker alive for the duration. Jobs are mirrored to chrome.storage.session so
+// finished ones stay listed (in every tab's popup) until dismissed; when the popup
+// reopens it re-syncs via queue:list and matches jobs to the page's candidates by URL. Preview (metadata for a candidate) is a simple
 // request/response; the popup drives it before the user commits to a download.
 
 import { uid } from '../lib/util.js';
-import { isTerminal, pickQueued } from './queue-core.js';
+import { isTerminal, pickQueued, restoreJobs } from './queue-core.js';
 
 const HOST = 'com.videograbitel.host';
 const MAX_CONCURRENT = 2;
@@ -22,6 +22,28 @@ const ports = new Map();
 /** @type {Map<string, string[]>} id -> in-memory log buffer (active jobs) */
 const logs = new Map();
 
+// --- session persistence (survives SW suspend/resume) -----------------------
+let loading = null;
+function ensureJobs() {
+  loading ||= chrome.storage.session
+    .get('jobs')
+    .then(({ jobs: saved }) => {
+      for (const j of restoreJobs(saved)) if (!jobs.has(j.id)) jobs.set(j.id, j);
+    })
+    .catch(() => {});
+  return loading;
+}
+
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    const list = [...jobs.values()].map(({ logTail, ...j }) => j);
+    chrome.storage.session.set({ jobs: list }).catch(() => {});
+  }, 500);
+}
+
 // --- broadcasting to the popup (when open) ----------------------------------
 function broadcast(type, payload) {
   chrome.runtime.sendMessage({ type, ...payload }).catch(() => {});
@@ -29,6 +51,7 @@ function broadcast(type, payload) {
 function update(job, patch) {
   Object.assign(job, patch);
   broadcast('job:update', { job });
+  scheduleSave();
 }
 
 // Keep memory bounded: drop the oldest terminal jobs once we exceed the cap.
@@ -55,7 +78,11 @@ function addJob(spec = {}) {
     filename: spec.filename || '',
     proxy: spec.proxy || '',
     headers: spec.headers && typeof spec.headers === 'object' ? spec.headers : null,
+    ugoira: spec.ugoira && typeof spec.ugoira === 'object' ? spec.ugoira : null,
     host: spec.host || '',
+    thumbnail: /^https?:\/\//i.test(spec.thumbnail || '') ? spec.thumbnail : '',
+    duration: Number(spec.duration) || 0,
+    uploader: String(spec.uploader || '').slice(0, 100),
     status: 'queued',
     percent: 0,
     total: '',
@@ -72,6 +99,7 @@ function addJob(spec = {}) {
   jobs.set(id, job);
   prune();
   broadcast('job:update', { job });
+  scheduleSave();
   pump();
   return id;
 }
@@ -168,6 +196,7 @@ function startJob(job) {
       filename: job.filename,
       proxy: job.proxy,
       headers: job.headers,
+      ugoira: job.ugoira,
     });
   } catch (e) {
     finishJob(job, { status: 'error', error: e.message });
@@ -251,6 +280,16 @@ function cancel(id) {
     return;
   }
   if (job.status === 'queued') finishJob(job, { status: 'cancelled' });
+}
+
+// Forget a finished job (its card's x button).
+function dismiss(id) {
+  const job = jobs.get(id);
+  if (!job || !isTerminal(job)) return;
+  jobs.delete(id);
+  logs.delete(id);
+  broadcast('job:removed', { id });
+  scheduleSave();
 }
 
 function retry(id) {
@@ -363,6 +402,8 @@ function friendlyError(text, job) {
   return null;
 }
 
+ensureJobs();
+
 // --- message dispatch (called by the service worker) ------------------------
 // Returns true if it owns the message (and will call sendResponse).
 export function handleQueueMessage(msg, sendResponse) {
@@ -371,29 +412,38 @@ export function handleQueueMessage(msg, sendResponse) {
       preview(msg, sendResponse);
       return true;
     case 'queue:add':
-      sendResponse({ id: addJob(msg.job || {}) });
+      ensureJobs().then(() => sendResponse({ id: addJob(msg.job || {}) }));
       return true;
     case 'queue:list':
-      sendResponse({ jobs: [...jobs.values()] });
+      ensureJobs().then(() => sendResponse({ jobs: [...jobs.values()] }));
+      return true;
+    case 'queue:dismiss':
+      ensureJobs().then(() => {
+        dismiss(msg.id);
+        sendResponse({ ok: true });
+      });
       return true;
     case 'queue:cancel':
-      cancel(msg.id);
-      sendResponse({ ok: true });
+      ensureJobs().then(() => {
+        cancel(msg.id);
+        sendResponse({ ok: true });
+      });
       return true;
     case 'queue:retry':
-      retry(msg.id);
-      sendResponse({ ok: true });
+      ensureJobs().then(() => {
+        retry(msg.id);
+        sendResponse({ ok: true });
+      });
       return true;
     case 'queue:log':
       sendResponse({ lines: logs.get(msg.id) || jobs.get(msg.id)?.logTail || [] });
       return true;
     case 'host:open':
-      hostFileAction('open', msg.id);
-      sendResponse({ ok: true });
-      return true;
     case 'host:reveal':
-      hostFileAction('reveal', msg.id);
-      sendResponse({ ok: true });
+      ensureJobs().then(() => {
+        hostFileAction(msg.type.slice(5), msg.id);
+        sendResponse({ ok: true });
+      });
       return true;
     case 'engine:check':
       engineCheck(sendResponse);

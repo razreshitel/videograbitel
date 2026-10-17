@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { proxyArgs, localProxyAddr, usableProxy, headerArgs } from '../src/native-host/args.js';
+import { proxyArgs, localProxyAddr, usableProxy, headerArgs, safeName } from '../src/native-host/args.js';
 
 test('proxyArgs accepts scheme URLs only', () => {
   assert.deepEqual(proxyArgs('http://u:p@127.0.0.1:8080'), ['--proxy', 'http://u:p@127.0.0.1:8080']);
@@ -42,4 +42,15 @@ test('headerArgs forwards browser headers and strips line breaks', () => {
   ]);
   assert.deepEqual(headerArgs({ referer: 'javascript:alert(1)' }), []);
   assert.deepEqual(headerArgs(null), []);
+});
+
+test('safeName: tidy page titles', () => {
+  assert.equal(
+    safeName('🦊 Jordy в X: «Just picked up Ace Combat 8 https://t.co/GpNUAt40Va» / X'),
+    '🦊 Jordy в X - «Just picked up Ace Combat 8» - X',
+  );
+  assert.equal(safeName('a/b\\c?.mp4'), 'a_b_c_');
+  assert.equal(safeName('100% done | Site'), '100_ done - Site');
+  assert.equal(safeName('  ...  '), '');
+  assert.equal(safeName('../../evil'), '_.._evil');
 });

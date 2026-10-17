@@ -9,7 +9,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { proxyArgs, usableProxy, headerArgs } from './args.js';
+import { proxyArgs, usableProxy, headerArgs, safeName } from './args.js';
+import { cleanUgoira, readZip, concatList, finalDelay, fetchBuffer } from './ugoira.js';
 
 const HOST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HOST_DIR, '..', '..');
@@ -27,20 +28,10 @@ const FFMPEG_DIR = fs.existsSync(path.join(BIN, 'ffmpeg' + EXE)) ? BIN : null;
 // Deno lets yt-dlp solve YouTube's JS challenges (avoids 403s / missing formats).
 const DENO = fs.existsSync(path.join(BIN, 'deno' + EXE)) ? path.join(BIN, 'deno' + EXE) : null;
 
-// Shared yt-dlp args: point it at our bundled JS runtime when present.
+// Shared yt-dlp args: UTF-8 output (Windows consoles default to the ANSI code
+// page, which mangles non-Latin file names) plus our bundled JS runtime.
 function jsRuntimeArgs() {
-  return DENO ? ['--js-runtimes', `deno:${DENO}`] : [];
-}
-
-
-// Turn a user-supplied name into a safe yt-dlp output base (no path traversal,
-// no '%' template injection, no trailing dot). Returns '' if nothing usable.
-function safeName(name) {
-  let s = String(name || '').trim();
-  s = s.replace(/[\\/:*?"<>|%]/g, '_'); // strip unsafe chars (keep spaces & hyphens)
-  s = s.replace(/\.(mp4|mkv|webm|mov|m4v|mp3|m4a|aac|opus|ogg|wav|flac)$/i, ''); // avoid double ext
-  s = s.replace(/[.\s]+$/, '').trim();
-  return s.slice(0, 180);
+  return ['--encoding', 'utf-8', ...(DENO ? ['--js-runtimes', `deno:${DENO}`] : [])];
 }
 
 // The Downloads folder can be relocated (e.g. to another drive or OneDrive), so
@@ -172,7 +163,8 @@ function handle(msg) {
       return download(msg);
     case 'cancel':
       cancelRequested = true;
-      killTree(current);
+      if (typeof current?.cancel === 'function') current.cancel();
+      else killTree(current);
       return;
     case 'reveal':
       return revealPath(msg.file);
@@ -320,6 +312,7 @@ async function download(msg) {
   if (proxy === null) send({ type: 'log', line: '[videograbitel] proxy is offline, downloading directly' });
 
   const outDir = downloadsDir();
+  if (msg.ugoira) return downloadUgoira(msg, proxy, outDir);
   // A user-renamed download uses that name as the output base; otherwise fall back
   // to yt-dlp's metadata title. Either way the name is sanitized and the root is
   // pinned with -P, so the (metadata- or user-) name can never steer the path.
@@ -408,6 +401,117 @@ async function download(msg) {
     else if (code === 0) send({ type: 'done', file: finalFile, outDir });
     else send({ type: 'error', message: `yt-dlp exited with code ${code}.`, detail: stderrTail.trim() });
   });
+}
+
+// Pixiv ugoira: frame ZIP -> GIF.
+async function downloadUgoira(msg, proxy, outDir) {
+  const ugo = cleanUgoira(msg.ugoira);
+  if (!ugo) return send({ type: 'error', message: 'Invalid ugoira data.' });
+  const ffmpeg = toolPath('ffmpeg');
+  const name = safeName(msg.filename) || `ugoira ${path.basename(new URL(ugo.zip).pathname, '.zip')}`;
+  const outFile = uniquePath(outDir, name, '.gif');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'videograbitel-'));
+  const ctrl = new AbortController();
+  let proc = null;
+  // Clean up before reporting: Chrome may kill us right after.
+  const finish = (m) => {
+    current = null;
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    } catch {
+      /* leave it to the OS */
+    }
+    send(m);
+  };
+  current = {
+    cancel() {
+      ctrl.abort();
+      killTree(proc);
+    },
+  };
+  send({ type: 'started', url: ugo.zip, outDir });
+  const headers = { Referer: 'https://www.pixiv.net/' };
+  if (msg.headers?.userAgent) headers['User-Agent'] = String(msg.headers.userAgent).replace(/[\r\n]/g, '');
+  const t0 = Date.now();
+  const tunnel = /^http:\/\//i.test(proxy || '') ? proxy : '';
+  if (proxy && !tunnel) send({ type: 'log', line: '[ugoira] only http:// proxies work here, downloading directly' });
+  try {
+    send({ type: 'log', line: `[ugoira] ${ugo.frames.length} frames from ${ugo.zip}` });
+    const zip = await fetchBuffer(ugo.zip, {
+      headers,
+      proxy: tunnel,
+      signal: ctrl.signal,
+      onProgress: throttle((got, total) => {
+        const secs = (Date.now() - t0) / 1000 || 1;
+        send({
+          type: 'progress',
+          percent: total ? (got / total) * 100 : 0,
+          total: total ? formatSize(total) : '',
+          speed: `${formatSize(got / secs)}/s`,
+          eta: '',
+        });
+      }),
+    });
+    const entries = readZip(zip);
+    for (const f of ugo.frames) {
+      const data = entries.get(f.file);
+      if (!data) throw new Error(`frame ${f.file} missing from the zip`);
+      fs.writeFileSync(path.join(tmp, f.file), data);
+    }
+    fs.writeFileSync(path.join(tmp, 'frames.txt'), concatList(ugo.frames));
+    if (cancelRequested) throw new Error('cancelled');
+    send({ type: 'phase', name: 'VideoConvertor' });
+    const args = [
+      '-hide_banner', '-loglevel', 'error', '-n',
+      '-f', 'concat', '-safe', '0', '-i', path.join(tmp, 'frames.txt'),
+      '-filter_complex', '[0:v]split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle',
+      '-fps_mode', 'passthrough', '-loop', '0', '-final_delay', String(finalDelay(ugo.frames)),
+      outFile,
+    ];
+    let errTail = '';
+    const code = await new Promise((resolve, reject) => {
+      proc = spawn(ffmpeg, args, { windowsHide: true });
+      proc.stderr.setEncoding('utf8');
+      proc.stderr.on('data', (d) => (errTail = `${errTail}${d}`.slice(-2000)));
+      proc.once('error', reject);
+      proc.once('close', resolve);
+    });
+    if (cancelRequested) throw new Error('cancelled');
+    if (code !== 0) throw new Error(`ffmpeg exited with code ${code}: ${errTail.trim()}`);
+    finish({ type: 'done', file: outFile, outDir });
+  } catch (e) {
+    fs.rmSync(outFile, { force: true });
+    if (cancelRequested) finish({ type: 'cancelled' });
+    else finish({ type: 'error', message: `Ugoira download failed: ${e.message}`, detail: e.message });
+  }
+}
+
+// First free "name (n).ext".
+function uniquePath(dir, base, ext) {
+  let p = path.join(dir, base + ext);
+  for (let n = 2; fs.existsSync(p); n++) p = path.join(dir, `${base} (${n})${ext}`);
+  return p;
+}
+
+function formatSize(n) {
+  const u = ['B', 'KiB', 'MiB', 'GiB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n.toFixed(i ? 2 : 0)}${u[i]}`;
+}
+
+// At most every 250 ms.
+function throttle(fn) {
+  let last = 0;
+  return (...a) => {
+    const now = Date.now();
+    if (now - last < 250) return;
+    last = now;
+    fn(...a);
+  };
 }
 
 // Split trimmed lines.

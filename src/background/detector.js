@@ -38,10 +38,43 @@ const SEGMENT_CTYPES = new Set([
 // webRequest resource types worth inspecting.
 const INTERESTING_TYPES = new Set(['media', 'xmlhttprequest', 'other', 'object', 'object_subrequest']);
 
-function headerValue(headers, name) {
+function rawHeader(headers, name) {
   if (!headers) return '';
   const h = headers.find((x) => x.name.toLowerCase() === name);
-  return h ? (h.value || '').toLowerCase() : '';
+  return h ? h.value || '' : '';
+}
+function headerValue(headers, name) {
+  return rawHeader(headers, name).toLowerCase();
+}
+
+// Filename from Content-Disposition, or ''.
+export function dispositionName(headers) {
+  const cd = rawHeader(headers, 'content-disposition');
+  if (!cd) return '';
+  let name = '';
+  const star = /filename\*\s*=\s*(?:utf-8|iso-8859-1)?'[^']*'([^;]+)/i.exec(cd);
+  if (star) {
+    try {
+      name = decodeURIComponent(star[1].trim());
+    } catch {
+      name = star[1].trim();
+    }
+  } else {
+    const plain = /filename\s*=\s*(?:"([^"]*)"|([^;]+))/i.exec(cd);
+    if (plain) name = (plain[1] ?? plain[2] ?? '').trim();
+  }
+  return name.split(/[\\/]/).pop().slice(0, 200);
+}
+
+// webRequest-shaped details from a probe (HEAD or ranged GET) response.
+export function probeDetails(url, get) {
+  const responseHeaders = [];
+  const put = (name, value) => value && responseHeaders.push({ name, value: String(value) });
+  put('content-type', get('content-type'));
+  const total = /\/\s*(\d+)\s*$/.exec(get('content-range') || '');
+  put('content-length', total ? total[1] : get('content-length'));
+  put('content-disposition', get('content-disposition'));
+  return { url, type: 'media', method: 'GET', responseHeaders };
 }
 
 export function isNoisyDirectUrl(url) {
@@ -62,10 +95,26 @@ export function isNoisyDirectUrl(url) {
   }
 }
 
+// Media that belongs to other posts on the page, not the page's own video.
+export function isSiteNoise(url, pageUrl) {
+  try {
+    const u = new URL(url);
+    const page = new URL(pageUrl).hostname.replace(/^(www|mobile)\./, '');
+    // X: reply GIFs; the main post comes via yt-dlp
+    if ((page === 'x.com' || page === 'twitter.com') && u.hostname === 'video.twimg.com') {
+      return /^\/tweet_video\//.test(u.pathname);
+    }
+  } catch {
+    /* bad URL */
+  }
+  return false;
+}
+
 /**
+ * @param {{trustName?: boolean}} opts trustName: URL came from page markup, skip the opaque-name filter
  * @returns {null | {kind:'hls'|'dash'|'direct', container:string, contentType:string, size:number}}
  */
-export function classify(details) {
+export function classify(details, opts = {}) {
   const { url, type, method } = details;
   if (!url || !/^https?:/i.test(url)) return null;
   // Real media is delivered over GET. YouTube's SABR streams it over POST, so
@@ -97,7 +146,7 @@ export function classify(details) {
     (ctype.startsWith('audio/') && !ctype.includes('mpegurl'));
 
   if (looksMedia) {
-    if (!DIRECT_EXTS.has(ext) && isNoisyDirectUrl(url)) return null;
+    if (!opts.trustName && !DIRECT_EXTS.has(ext) && isNoisyDirectUrl(url)) return null;
     // A standalone media file worth listing is essentially never < 50 KB. This
     // drops ad creatives, range chunks and SABR probes that carry a video/*
     // type (or even a .mp4 name) but are only a few KB.

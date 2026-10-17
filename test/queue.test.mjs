@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isActive, isTerminal, availableSlots, pickQueued } from '../src/background/queue-core.js';
+import { isActive, isTerminal, availableSlots, pickQueued, restoreJobs } from '../src/background/queue-core.js';
 
 const job = (over) => ({ id: 'x', status: 'queued', createdAt: 0, endedAt: 0, ...over });
 
@@ -43,4 +43,9 @@ test('pickQueued returns oldest queued jobs up to free slots', () => {
 test('pickQueued returns nothing when full', () => {
   const jobs = [job({ status: 'running' }), job({ status: 'running' }), job({ status: 'queued' })];
   assert.deepEqual(pickQueued(jobs, 2), []);
+});
+
+test('restoreJobs marks unfinished jobs interrupted', () => {
+  const out = restoreJobs([job({ id: 'a', url: 'u', status: 'running' }), job({ id: 'b', url: 'u', status: 'done' }), { id: 'c' }, null]);
+  assert.deepEqual(out.map((j) => [j.id, j.status]), [['a', 'error'], ['b', 'done']]);
 });
